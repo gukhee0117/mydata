@@ -6,6 +6,7 @@ import com.app.mydata.domain.mydata.dto.request.MydataRiaAccountRequestDTO;
 import com.app.mydata.domain.mydata.dto.request.RiaAccountRequestDTO;
 import com.app.mydata.domain.mydata.dto.response.MydataRiaAccountResponseDTO;
 import com.app.mydata.domain.mydata.exception.MydataRiaAccountException;
+import com.app.mydata.domain.mydata.exception.MydataRiaAccountNotFoundException;
 import com.app.mydata.domain.mydata.mapper.MydataKeyMapper;
 import com.app.mydata.domain.mydata.mapper.MydataRiaAccountMapper;
 import org.junit.jupiter.api.Test;
@@ -14,6 +15,7 @@ import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.ArgumentCaptor;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.dao.DataIntegrityViolationException;
 
 import java.math.BigDecimal;
 import java.util.List;
@@ -25,6 +27,9 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.doNothing;
+import static org.mockito.Mockito.times;
 
 @ExtendWith(MockitoExtension.class)
 class MydataRiaAccountServiceImplTest {
@@ -34,6 +39,9 @@ class MydataRiaAccountServiceImplTest {
 
     @Mock
     private MydataKeyMapper mydataKeyMapper;
+
+    @Mock
+    private MydataRiaAccountUpsertExecutor upsertExecutor;
 
     @InjectMocks
     private MydataRiaAccountServiceImpl mydataRiaAccountService;
@@ -73,7 +81,7 @@ class MydataRiaAccountServiceImplTest {
         when(mydataKeyMapper.existsByCiHash(ciHash)).thenReturn(0);
 
         assertThatThrownBy(() -> mydataRiaAccountService.getAccountsByCiHash(request))
-                .isInstanceOf(MydataRiaAccountException.class)
+                .isInstanceOf(MydataRiaAccountNotFoundException.class)
                 .hasMessage("등록되지 않은 CiHash입니다.");
 
         verifyNoInteractions(mydataRiaAccountMapper);
@@ -115,7 +123,7 @@ class MydataRiaAccountServiceImplTest {
         MydataRiaAccountResponseDTO result = mydataRiaAccountService.syncRiaAccount(request);
 
         ArgumentCaptor<MydataRiaAccountDTO> captor = ArgumentCaptor.forClass(MydataRiaAccountDTO.class);
-        verify(mydataRiaAccountMapper).upsertAccount(captor.capture());
+        verify(upsertExecutor).upsert(captor.capture());
         assertThat(captor.getValue().getRiaCumulativeSell()).isNull();
         assertThat(result.getMydataAccountId()).isEqualTo(1L);
         assertThat(result.getRiaCumulativeSell()).isEqualByComparingTo(BigDecimal.ZERO);
@@ -142,7 +150,7 @@ class MydataRiaAccountServiceImplTest {
         MydataRiaAccountResponseDTO result = mydataRiaAccountService.syncRiaAccount(request);
 
         ArgumentCaptor<MydataRiaAccountDTO> captor = ArgumentCaptor.forClass(MydataRiaAccountDTO.class);
-        verify(mydataRiaAccountMapper).upsertAccount(captor.capture());
+        verify(upsertExecutor).upsert(captor.capture());
         assertThat(captor.getValue().getRiaLimit()).isEqualByComparingTo(BigDecimal.valueOf(30_000_000));
         assertThat(captor.getValue().getRiaCumulativeSell()).isNull();
         assertThat(result.getMydataAccountId()).isEqualTo(1L);
@@ -172,7 +180,7 @@ class MydataRiaAccountServiceImplTest {
         MydataRiaAccountResponseDTO result = mydataRiaAccountService.syncRiaAccount(request);
 
         assertThat(result.getMydataAccountId()).isEqualTo(2L);
-        verify(mydataRiaAccountMapper).upsertAccount(org.mockito.ArgumentMatchers.any());
+        verify(upsertExecutor).upsert(org.mockito.ArgumentMatchers.any());
         verify(mydataRiaAccountMapper, never()).insertAccount(org.mockito.ArgumentMatchers.any());
     }
 
@@ -186,7 +194,7 @@ class MydataRiaAccountServiceImplTest {
         when(mydataKeyMapper.existsByCiHash("unknown-ci-hash")).thenReturn(0);
 
         assertThatThrownBy(() -> mydataRiaAccountService.syncRiaAccount(request))
-                .isInstanceOf(MydataRiaAccountException.class)
+                .isInstanceOf(MydataRiaAccountNotFoundException.class)
                 .hasMessage("등록되지 않은 사용자 입니다.");
 
         verifyNoInteractions(mydataRiaAccountMapper);
@@ -207,7 +215,34 @@ class MydataRiaAccountServiceImplTest {
                 .isInstanceOf(MydataRiaAccountException.class)
                 .hasMessage("재조회 실패");
 
-        verify(mydataRiaAccountMapper).upsertAccount(org.mockito.ArgumentMatchers.any());
+        verify(upsertExecutor).upsert(org.mockito.ArgumentMatchers.any());
+    }
+
+    @Test
+    void syncRiaAccountRetriesOnceWhenUpsertConflictsThenSucceeds() {
+        RiaAccountRequestDTO request = RiaAccountRequestDTO.builder()
+                .ciHash("test-ci-hash")
+                .brokerName("증권사A")
+                .riaLimit(BigDecimal.valueOf(30_000_000))
+                .build();
+        MydataRiaAccountDTO savedAccount = MydataRiaAccountDTO.builder()
+                .mydataAccountId(1L)
+                .ciHash("test-ci-hash")
+                .brokerName("증권사A")
+                .riaLimit(BigDecimal.valueOf(30_000_000))
+                .riaCumulativeSell(BigDecimal.ZERO)
+                .build();
+        when(mydataKeyMapper.existsByCiHash("test-ci-hash")).thenReturn(1);
+        when(mydataRiaAccountMapper.selectByCiHashAndBrokerName(org.mockito.ArgumentMatchers.any()))
+                .thenReturn(Optional.of(savedAccount));
+        doThrow(new DataIntegrityViolationException("unique violation"))
+                .doNothing()
+                .when(upsertExecutor).upsert(org.mockito.ArgumentMatchers.any());
+
+        MydataRiaAccountResponseDTO result = mydataRiaAccountService.syncRiaAccount(request);
+
+        verify(upsertExecutor, times(2)).upsert(org.mockito.ArgumentMatchers.any());
+        assertThat(result.getMydataAccountId()).isEqualTo(1L);
     }
 
 }
